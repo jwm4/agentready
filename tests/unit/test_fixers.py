@@ -14,9 +14,10 @@ from agentready.fixers.documentation import (
     CLAUDEmdFixer,
     GitignoreFixer,
 )
+from agentready.fixers.testing import PrecommitHooksFixer
 from agentready.models.attribute import Attribute
 from agentready.models.finding import Finding, Remediation
-from agentready.models.fix import CommandFix, Fix, MultiStepFix
+from agentready.models.fix import CommandFix, FileCreationFix, Fix, MultiStepFix
 from agentready.models.repository import Repository
 
 
@@ -101,6 +102,40 @@ def gitignore_failing_finding():
         score=50.0,
         measured_value="50% coverage",
         threshold=">90% coverage",
+        evidence=[],
+        remediation=remediation,
+        error_message=None,
+    )
+
+
+@pytest.fixture
+def precommit_hooks_failing_finding():
+    """Create a failing finding for pre-commit hooks."""
+    attribute = Attribute(
+        id="precommit_hooks",
+        name="Pre-commit Hooks",
+        description="Repository has pre-commit hooks configured",
+        category="Testing",
+        tier=2,
+        criteria="Pre-commit config exists",
+        default_weight=0.05,
+    )
+
+    remediation = Remediation(
+        summary="Add pre-commit hooks",
+        steps=["Create .pre-commit-config.yaml", "Run pre-commit install"],
+        tools=["pre-commit"],
+        commands=["pre-commit install"],
+        examples=[],
+        citations=[],
+    )
+
+    return Finding(
+        attribute=attribute,
+        status="fail",
+        score=0.0,
+        measured_value="Not configured",
+        threshold="Configured",
         evidence=[],
         remediation=remediation,
         error_message=None,
@@ -331,3 +366,191 @@ class TestGitignoreFixer:
         content = gitignore_path.read_text()
         assert "# AgentReady recommended patterns" in content
         assert "__pycache__/" in content
+
+
+class TestPrecommitHooksFixer:
+    """Tests for PrecommitHooksFixer.
+
+    These tests verify the fix for issue #271 / PR #269 where the template path
+    was incorrectly specified as `precommit-{lang}.yaml.j2` instead of
+    `{lang}/precommit.yaml.j2`.
+    """
+
+    def test_attribute_id(self):
+        """Test attribute ID matches."""
+        fixer = PrecommitHooksFixer()
+        assert fixer.attribute_id == "precommit_hooks"
+
+    def test_can_fix_failing_finding(self, precommit_hooks_failing_finding):
+        """Test can fix failing pre-commit hooks finding."""
+        fixer = PrecommitHooksFixer()
+        assert fixer.can_fix(precommit_hooks_failing_finding) is True
+
+    def test_cannot_fix_passing_finding(self, precommit_hooks_failing_finding):
+        """Test cannot fix passing finding."""
+        fixer = PrecommitHooksFixer()
+        precommit_hooks_failing_finding.status = "pass"
+        assert fixer.can_fix(precommit_hooks_failing_finding) is False
+
+    def test_cannot_fix_wrong_attribute(self, gitignore_failing_finding):
+        """Test cannot fix finding with wrong attribute ID."""
+        fixer = PrecommitHooksFixer()
+        assert fixer.can_fix(gitignore_failing_finding) is False
+
+    def test_generate_fix_returns_multistep_fix(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test generate_fix returns MultiStepFix with file creation and install command."""
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        assert fix is not None
+        assert isinstance(fix, MultiStepFix)
+        assert len(fix.steps) == 2
+        assert fix.attribute_id == "precommit_hooks"
+        assert fix.points_gained > 0
+
+    def test_generate_fix_first_step_creates_config_file(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test first step is FileCreationFix for .pre-commit-config.yaml."""
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        assert isinstance(fix.steps[0], FileCreationFix)
+        assert fix.steps[0].file_path == Path(".pre-commit-config.yaml")
+        assert fix.steps[0].repository_path == temp_repo.path
+
+    def test_generate_fix_second_step_installs_hooks(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test second step is CommandFix to install pre-commit hooks."""
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        assert isinstance(fix.steps[1], CommandFix)
+        assert fix.steps[1].command == "pre-commit install"
+        assert fix.steps[1].repository_path == temp_repo.path
+
+    def test_generate_fix_uses_python_template_by_default(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test uses Python template when no languages specified."""
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        # Python template should include black formatter
+        assert "black" in fix.steps[0].content.lower()
+
+    def test_generate_fix_uses_python_template_for_python_repo(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test uses Python template for Python repositories."""
+        temp_repo.languages = {"Python": 80, "Shell": 20}
+
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        # Python template should include black formatter
+        assert "black" in fix.steps[0].content.lower()
+
+    def test_generate_fix_uses_go_template_for_go_repo(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test uses Go template for Go repositories (regression test for #271)."""
+        temp_repo.languages = {"Go": 90, "Shell": 10}
+
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        # Go template should include gofmt or golangci-lint
+        content = fix.steps[0].content.lower()
+        assert "go" in content
+
+    def test_generate_fix_uses_javascript_template_for_js_repo(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test uses JavaScript template for JavaScript repositories."""
+        temp_repo.languages = {"JavaScript": 70, "CSS": 30}
+
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        # JavaScript template should include prettier or eslint
+        content = fix.steps[0].content.lower()
+        assert "prettier" in content or "eslint" in content or "javascript" in content
+
+    def test_generate_fix_fallback_to_python_for_unknown_language(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test falls back to Python template for unknown languages."""
+        temp_repo.languages = {"Brainfuck": 100}
+
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        # Should fallback to Python template (black formatter)
+        assert fix is not None
+        assert "black" in fix.steps[0].content.lower()
+
+    def test_apply_fix_dry_run_does_not_create_file(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test dry run does not create the config file."""
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        result = fix.steps[0].apply(dry_run=True)
+        assert result is True
+        assert not (temp_repo.path / ".pre-commit-config.yaml").exists()
+
+    def test_apply_fix_creates_config_file(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test applying fix creates .pre-commit-config.yaml."""
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        result = fix.steps[0].apply(dry_run=False)
+        assert result is True
+
+        config_path = temp_repo.path / ".pre-commit-config.yaml"
+        assert config_path.exists()
+        content = config_path.read_text()
+        assert "repos:" in content
+
+    def test_apply_fix_fails_if_config_exists(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Test applying fix fails if .pre-commit-config.yaml already exists."""
+        # Create existing config
+        config_path = temp_repo.path / ".pre-commit-config.yaml"
+        config_path.write_text("# Existing config\n")
+
+        fixer = PrecommitHooksFixer()
+        fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+        result = fix.steps[0].apply(dry_run=False)
+        assert result is False
+
+        # Original content should be preserved
+        assert config_path.read_text() == "# Existing config\n"
+
+    def test_template_path_uses_correct_directory_structure(
+        self, temp_repo, precommit_hooks_failing_finding
+    ):
+        """Regression test for #271: verify template path is {lang}/precommit.yaml.j2."""
+        # This test verifies the fix from PR #269 - the template loader
+        # should find templates at {lang}/precommit.yaml.j2, not precommit-{lang}.yaml.j2
+        fixer = PrecommitHooksFixer()
+
+        # Test that all supported language templates can be loaded
+        for lang in ["python", "go", "javascript"]:
+            temp_repo.languages = {lang.capitalize(): 100}
+            fix = fixer.generate_fix(temp_repo, precommit_hooks_failing_finding)
+
+            # Should not raise TemplateNotFound
+            assert fix is not None
+            assert isinstance(fix.steps[0], FileCreationFix)
+            # Content should be non-empty (template was found and rendered)
+            assert len(fix.steps[0].content) > 0
